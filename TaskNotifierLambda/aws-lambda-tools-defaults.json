@@ -21,6 +21,6 @@
   "function-subnets": "",
   "function-security-groups": "",
   "tracing-mode": "PassThrough",
-  "environment-variables": "",
+  "environment-variables": "\u0022SES_FROM_EMAIL\u0022=\u0022luis.practical.aws1@gmail.com\u0022",
   "image-tag": ""
 }

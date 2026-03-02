@@ -1,129 +1,157 @@
-﻿using Amazon.Lambda.Core;
+﻿using System.Text.Json;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.SQSEvents;
 using Amazon.SimpleEmail;
+using Amazon.SimpleEmail.Model;
 using TaskNotifierLambda.Models;
-using TaskNotifierLambda.Services;
 
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
 
 namespace TaskNotifierLambda;
 
-/// <summary>
-/// Handler de la Lambda de notificaciones por email.
-/// 
-/// FLUJO COMPLETO:
-///   1. Tu TaskService (backend .NET) detecta un evento relevante
-///      (tarea asignada, estado cambiado, etc.)
-///   2. TaskService serializa un TaskNotificationEvent como JSON
-///   3. TaskService invoca esta Lambda de forma ASÍNCRONA via IAmazonLambda.InvokeAsync
-///      (InvocationType.Event = fire-and-forget, no bloquea el request del usuario)
-///   4. Lambda deserializa el evento y llama al EmailService correcto
-///   5. EmailService envía el email via Amazon SES
-/// 
-/// VARIABLES DE ENTORNO requeridas en AWS Lambda Console:
-///   SENDER_EMAIL  → email verificado en SES (ej: noreply@tudominio.com)
-///   APP_BASE_URL  → URL de tu frontend (ej: https://tuapp.com) — para links en los emails
-/// </summary>
 public class Function
 {
-    private readonly EmailService _emailService;
+    private readonly IAmazonSimpleEmailService _sesClient;
 
-    // Constructor sin parámetros: Lambda lo usa en producción
+    // IMPORTANTE: leer de variable de entorno, no hardcodear
+    private readonly string _fromEmail = Environment.GetEnvironmentVariable("SES_FROM_EMAIL")
+                                         ?? throw new Exception("SES_FROM_EMAIL no configurado");
+
     public Function()
     {
-        var sesClient = new AmazonSimpleEmailServiceClient();
-
-        var senderEmail = Environment.GetEnvironmentVariable("SENDER_EMAIL")
-            ?? throw new InvalidOperationException(
-                "Variable de entorno SENDER_EMAIL no configurada. " +
-                "Configúrala en AWS Lambda Console → Configuration → Environment variables.");
-
-        var appBaseUrl = Environment.GetEnvironmentVariable("APP_BASE_URL")
-            ?? "https://tuapp.com";
-
-        _emailService = new EmailService(sesClient, senderEmail, appBaseUrl);
+        _sesClient = new AmazonSimpleEmailServiceClient();
     }
 
-    // Constructor para tests: permite inyectar mocks
-    public Function(EmailService emailService)
+    // Constructor para testing
+    public Function(IAmazonSimpleEmailService sesClient)
     {
-        _emailService = emailService;
+        _sesClient = sesClient;
     }
 
     /// <summary>
-    /// Entry point de la Lambda.
-    /// Recibe el TaskNotificationEvent que serialize tu TaskService y enruta al método correcto.
+    /// Handler principal. SQS puede enviar múltiples mensajes a la vez (batch).
+    /// Procesamos cada uno individualmente para que los fallos no afecten al batch completo.
     /// </summary>
-    public async Task FunctionHandler(TaskNotificationEvent evt, ILambdaContext context)
+    public async Task<SQSBatchResponse> FunctionHandler(SQSEvent sqsEvent, ILambdaContext context)
     {
-        context.Logger.LogInformation(
-            $"[TaskNotifier] Evento recibido: Type={evt.EventType} | " +
-            $"Task={evt.TaskId} | To={evt.AssignedUserEmail}");
-
-        // Validaciones básicas antes de intentar enviar
-        if (string.IsNullOrWhiteSpace(evt.AssignedUserEmail))
+        // SQSBatchResponse permite reportar qué mensajes fallaron individualmente
+        // Los mensajes fallidos se reencolan y eventualmente van a la DLQ
+        var batchResponse = new SQSBatchResponse
         {
-            context.Logger.LogWarning("[TaskNotifier] AssignedUserEmail vacío — se omite el envío.");
-            return;
-        }
+            BatchItemFailures = new List<SQSBatchResponse.BatchItemFailure>()
+        };
 
-        if (string.IsNullOrWhiteSpace(evt.EventType))
+        foreach (var message in sqsEvent.Records)
         {
-            context.Logger.LogWarning("[TaskNotifier] EventType vacío — se omite el envío.");
-            return;
-        }
-
-        try
-        {
-            switch (evt.EventType)
+            try
             {
-                case "TaskAssigned":
-                    await _emailService.SendTaskAssignedEmailAsync(evt);
-                    context.Logger.LogInformation(
-                        $"[TaskNotifier] ✅ Email 'TaskAssigned' enviado a {evt.AssignedUserEmail}");
-                    break;
+                context.Logger.LogInformation(
+                    $"[TaskNotifier] Procesando mensaje {message.MessageId}");
 
-                case "TaskStatusChanged":
-                    // Solo enviar si realmente cambió el estado (defensa contra datos incorrectos)
-                    if (evt.OldStatus == evt.NewStatus)
-                    {
-                        context.Logger.LogInformation(
-                            "[TaskNotifier] Estado sin cambio real — se omite el envío.");
-                        return;
-                    }
-                    await _emailService.SendTaskStatusChangedEmailAsync(evt);
-                    context.Logger.LogInformation(
-                        $"[TaskNotifier] ✅ Email 'TaskStatusChanged' enviado a {evt.AssignedUserEmail} " +
-                        $"({evt.OldStatus} → {evt.NewStatus})");
-                    break;
+                // Los mensajes de SNS vienen envueltos en un sobre JSON
+                var snsWrapper = JsonSerializer.Deserialize<SnsMessageWrapper>(message.Body)!;
+                var notification = JsonSerializer.Deserialize<TaskNotificationEvent>(snsWrapper.Message)!;
 
-                case "TaskDueSoon":
-                    if (!evt.DueDate.HasValue)
-                    {
-                        context.Logger.LogWarning(
-                            "[TaskNotifier] TaskDueSoon sin DueDate — se omite el envío.");
-                        return;
-                    }
-                    await _emailService.SendTaskDueSoonEmailAsync(evt);
-                    context.Logger.LogInformation(
-                        $"[TaskNotifier] ✅ Email 'TaskDueSoon' enviado a {evt.AssignedUserEmail}");
-                    break;
+                await SendEmailAsync(notification, context);
 
-                default:
-                    // Loggear sin lanzar excepción: un EventType desconocido no debe hacer fallar la Lambda
-                    context.Logger.LogWarning(
-                        $"[TaskNotifier] EventType desconocido: '{evt.EventType}'. " +
-                        "Valores válidos: TaskAssigned, TaskStatusChanged, TaskDueSoon.");
-                    break;
+                context.Logger.LogInformation(
+                    $"[TaskNotifier] Email enviado para tarea {notification.TaskId} → {notification.AssignedUserEmail}");
+            }
+            catch (Exception ex)
+            {
+                // Marcar este mensaje como fallido — SQS lo reintentará
+                context.Logger.LogError(
+                    $"[TaskNotifier] Error procesando mensaje {message.MessageId}: {ex.Message}");
+
+                batchResponse.BatchItemFailures.Add(new SQSBatchResponse.BatchItemFailure
+                {
+                    ItemIdentifier = message.MessageId
+                });
             }
         }
-        catch (Exception ex)
-        {
-            context.Logger.LogError(
-                $"[TaskNotifier] ❌ Error enviando email para evento '{evt.EventType}' " +
-                $"(tarea {evt.TaskId}): {ex.GetType().Name}: {ex.Message}");
 
-            // Re-lanzar para que CloudWatch Alarms detecte el fallo
-            throw;
-        }
+        return batchResponse;
     }
+
+    private async Task SendEmailAsync(TaskNotificationEvent notification, ILambdaContext context)
+    {
+        var subject = notification.EventType switch
+        {
+            "TaskAssigned" => $"📋 Nueva tarea asignada: {notification.TaskTitle}",
+            "TaskStatusChanged" => $"🔄 Actualización de tarea: {notification.TaskTitle}",
+            _ => $"Notificación: {notification.TaskTitle}"
+        };
+
+        var htmlBody = BuildEmailBody(notification);
+
+        var request = new SendEmailRequest
+        {
+            Source = _fromEmail,
+            Destination = new Destination
+            {
+                ToAddresses = new List<string> { notification.AssignedUserEmail }
+            },
+            Message = new Message
+            {
+                Subject = new Content(subject),
+                Body = new Body
+                {
+                    Html = new Content
+                    {
+                        Charset = "UTF-8",
+                        Data = htmlBody
+                    }
+                }
+            }
+        };
+
+        await _sesClient.SendEmailAsync(request);
+    }
+
+    private string BuildEmailBody(TaskNotificationEvent n)
+    {
+        var dueDateStr = n.DueDate.HasValue
+            ? n.DueDate.Value.ToString("dd/MM/yyyy")
+            : "Sin fecha límite";
+
+        var statusSection = n.EventType == "TaskStatusChanged"
+            ? $"<p><strong>Estado:</strong> {n.OldStatus} → <strong>{n.NewStatus}</strong></p>"
+            : $"<p><strong>Estado inicial:</strong> {n.NewStatus}</p>";
+
+        return $"""
+            <!DOCTYPE html>
+            <html>
+            <body style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px;">
+              <h2 style="color: #2563EB;">Sistema de Gestión de Proyectos</h2>
+              <hr/>
+              <h3>{(n.EventType == "TaskAssigned" ? "Se te ha asignado una tarea" : "Una tarea fue actualizada")}</h3>
+              <p>Hola <strong>{n.AssignedUserName}</strong>,</p>
+              <p>{(n.EventType == "TaskAssigned"
+                    ? $"{n.AssignerName ?? "Un administrador"} te asignó la siguiente tarea:"
+                    : $"La tarea fue actualizada en el proyecto <strong>{n.ProjectName}</strong>:")}</p>
+              <div style="background:#F3F4F6; padding:16px; border-radius:8px; margin:16px 0;">
+                <p><strong>Tarea:</strong> {n.TaskTitle}</p>
+                <p><strong>Proyecto:</strong> {n.ProjectName}</p>
+                {statusSection}
+                <p><strong>Fecha límite:</strong> {dueDateStr}</p>
+                {(n.TaskDescription != null ? $"<p><strong>Descripción:</strong> {n.TaskDescription}</p>" : "")}
+              </div>
+              <p style="color:#6B7280; font-size:12px;">Este es un correo automático, no responder.</p>
+            </body>
+            </html>
+            """;
+    }
+}
+
+/// <summary>
+/// SNS envuelve el mensaje original en este sobre JSON.
+/// El campo "Message" contiene el payload real que publicó tu backend.
+/// </summary>
+public class SnsMessageWrapper
+{
+    public string Type { get; set; } = "";
+    public string MessageId { get; set; } = "";
+    public string Message { get; set; } = "";  // ← Aquí está tu TaskNotificationEvent serializado
+    public string Subject { get; set; } = "";
+    public string Timestamp { get; set; } = "";
 }
